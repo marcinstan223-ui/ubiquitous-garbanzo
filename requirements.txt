@@ -1,0 +1,3 @@
+# Plik requirements.txt
+# Używamy tylko wbudowanych bibliotek Pythona, 
+# ale ten plik jest potrzebny, żeby Railway wiedział, że to projekt w Pythonie.
